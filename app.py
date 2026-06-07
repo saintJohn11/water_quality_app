@@ -1,6 +1,6 @@
 """
 Water Quality Classification — Streamlit Prediction App
-Supports: Random Forest | XGBoost | Deep Learning (numpy inference)
+Supports: Random Forest | XGBoost | Deep Learning (Keras)
 
 NEW: For any feature you don't have a measurement for, the app asks
      3 proxy questions and estimates the value from your answers.
@@ -13,38 +13,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import joblib
-import json
 import os
 
-
-# ── Pure-numpy Deep Learning inference (no TensorFlow needed) ──────────────────
-def _relu(x):    return np.maximum(0, x)
-def _sigmoid(x): return 1 / (1 + np.exp(-x))
-
-@st.cache_resource
-def load_dl_weights(weights_path="dl_model_weights.json"):
-    """Load model weights from JSON. Returns list of layer dicts, or None."""
-    for path in [weights_path, os.path.join("deployed_models", weights_path)]:
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-    return None
-
-def numpy_dl_predict(layers_data, X):
-    """Run DL inference with pure numpy. Returns probabilities (n_samples,)."""
-    out = np.array(X, dtype=np.float64)
-    for layer in layers_data:
-        t = layer["type"]
-        w = layer["weights"]
-        if t == "Dense":
-            W, b = np.array(w[0]), np.array(w[1])
-            out = out @ W + b
-            out = _sigmoid(out) if W.shape[1] == 1 else _relu(out)
-        elif t == "BatchNormalization":
-            gamma, beta, mean, var = [np.array(x) for x in w]
-            out = gamma * (out - mean) / np.sqrt(var + 1e-3) + beta
-        # Dropout is a no-op at inference time
-    return out.flatten()
+try:
+    from tensorflow import keras
+    KERAS_AVAILABLE = True
+except ImportError:
+    KERAS_AVAILABLE = False
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -443,12 +418,16 @@ def load_models():
 
     rf_path     = _find("rf_model.pkl")
     xgb_path    = _find("xgb_model.pkl")
-    dl_layers   = load_dl_weights("dl_model_weights.json")
+    dl_path     = _find("dl_model.keras")
     scaler_path = _find("robust_scaler.pkl")
 
     rf  = joblib.load(rf_path)  if rf_path  else MockClassifier("Random Forest")
     xgb = joblib.load(xgb_path) if xgb_path else MockClassifier("XGBoost")
-    dl  = dl_layers  # will be None if file not found — handled in predict_with
+
+    if KERAS_AVAILABLE and dl_path:
+        dl = keras.models.load_model(dl_path)
+    else:
+        dl = MockKerasModel()
 
     scaler = joblib.load(scaler_path) if scaler_path else None
 
@@ -473,17 +452,11 @@ def predict_with(models, X: np.ndarray, selected: str) -> dict:
     # Apply RobustScaler if available (matches training pipeline)
     X_scaled = scaler.transform(X) if scaler is not None else X
 
-    # Deep Learning: use numpy inference if weights loaded, else mock
-    def dl_predict():
-        if dl is not None:
-            return numpy_dl_predict(dl, X_scaled)
-        return MockKerasModel().predict(X_scaled).flatten()
-
     results = {}
     runners = {
         "Random Forest": lambda: rf.predict_proba(X_scaled)[:, 1],
         "XGBoost":       lambda: xgb.predict_proba(X_scaled)[:, 1],
-        "Deep Learning": dl_predict,
+        "Deep Learning": lambda: dl.predict(X_scaled).flatten(),
     }
     targets = list(runners.keys()) if selected == "Ensemble (All)" else [selected]
     for name in targets:
@@ -675,59 +648,28 @@ def render_model_selector() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_water_tips():
-    import json
-    tips_js = json.dumps([(e, t) for e, t in WATER_TIPS])
-    html = f"""
-    <style>
-      #tip-wrap {{
-        margin: 14px 0 4px 0;
-        padding: 14px 18px;
-        border-radius: 10px;
-        background: linear-gradient(135deg, #0d2137 0%, #0a1628 100%);
-        border: 1px solid #1e3a5f;
-        min-height: 70px;
-        display: flex;
-        align-items: center;
-        gap: 14px;
-      }}
-      #tip-emoji {{ font-size: 28px; flex-shrink: 0; }}
-      #tip-label {{
-        font-size: 10px; font-weight: 700; letter-spacing: 1.5px;
-        color: #3498db; text-transform: uppercase; margin-bottom: 3px;
-      }}
-      #tip-text {{
-        color: #dce8f5; font-size: 13px; line-height: 1.5;
-        transition: opacity 0.5s ease;
-      }}
-    </style>
-    <div id="tip-wrap">
-      <div id="tip-emoji">💧</div>
-      <div>
-        <div id="tip-label">💡 Did you know?</div>
-        <div id="tip-text">Loading tip...</div>
-      </div>
-    </div>
-    <script>
-      const tips = {tips_js};
-      let idx = Math.floor(Math.random() * tips.length);
+    # Use session state to track current tip index
+    if "tip_index" not in st.session_state:
+        st.session_state.tip_index = int(np.random.randint(0, len(WATER_TIPS)))
 
-      function showTip() {{
-        const el = document.getElementById('tip-text');
-        const em = document.getElementById('tip-emoji');
-        el.style.opacity = 0;
-        setTimeout(() => {{
-          el.textContent = tips[idx][1];
-          em.textContent = tips[idx][0];
-          el.style.opacity = 1;
-          idx = (idx + 1) % tips.length;
-        }}, 500);
-      }}
+    emoji, tip = WATER_TIPS[st.session_state.tip_index]
 
-      showTip();
-      setInterval(showTip, 6000);
-    </script>
-    """
-    st.html(html)
+    st.markdown(
+        f"""<div style='margin:14px 0 4px 0;padding:14px 18px;border-radius:10px;
+        background:linear-gradient(135deg,#0d2137 0%,#0a1628 100%);
+        border:1px solid #1e3a5f;display:flex;align-items:center;gap:14px;'>
+        <div style='font-size:28px;flex-shrink:0'>{emoji}</div>
+        <div>
+          <div style='font-size:10px;font-weight:700;letter-spacing:1.5px;
+          color:#3498db;text-transform:uppercase;margin-bottom:3px'>💡 Did you know?</div>
+          <div style='color:#dce8f5;font-size:13px;line-height:1.5'>{tip}</div>
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Next tip →", key="next_tip"):
+        st.session_state.tip_index = (st.session_state.tip_index + 1) % len(WATER_TIPS)
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
